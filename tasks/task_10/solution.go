@@ -1,9 +1,13 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
+	"slices"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -35,44 +39,181 @@ type inMemoryTaskRepo struct {
 }
 
 func NewInMemoryTaskRepo(clock Clock) TaskRepo {
-	panic("TODO: implement")
+	return &inMemoryTaskRepo{
+		clock: clock,
+		tasks: make(map[string]Task),
+	}
 }
 func (r *inMemoryTaskRepo) Create(title string) (Task, error) {
-	panic("TODO: implement")
+	title = strings.TrimSpace(title)
+	if title == "" {
+		return Task{}, ErrInvalidTitle
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.seq++
+	task := Task{
+		ID:        strconv.FormatUint(r.seq, 10),
+		Title:     title,
+		UpdatedAt: r.clock.Now(),
+	}
+	r.tasks[task.ID] = task
+	return task, nil
 }
 func (r *inMemoryTaskRepo) Get(id string) (Task, bool) {
-	panic("TODO: implement")
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	task, ok := r.tasks[id]
+	return task, ok
 }
 func (r *inMemoryTaskRepo) List(done bool) []Task {
-	panic("TODO: implement")
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	list := []Task{}
+	for _, task := range r.tasks {
+		if task.Done == done {
+			list = append(list, task)
+		}
+	}
+	return list
 }
 func (r *inMemoryTaskRepo) SetDone(id string, done bool) (Task, error) {
-	panic("TODO: implement")
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	task, ok := r.tasks[id]
+	if !ok {
+		return Task{}, ErrNotFound
+	}
+	if task.Done != done {
+		task.Done = done
+		task.UpdatedAt = r.clock.Now()
+		r.tasks[id] = task
+	}
+	return task, nil
 }
 
 type httpHandler struct{ repo TaskRepo }
 
 func NewHTTPHandler(repo TaskRepo) http.Handler {
-	panic("TODO: implement")
+	return &httpHandler{repo: repo}
 }
 func (h *httpHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	panic("TODO: implement")
+	if r.URL.Path == "/tasks" {
+		switch r.Method {
+		case http.MethodGet:
+			h.handleList(w, r)
+		case http.MethodPost:
+			h.handleCreate(w, r)
+		default:
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		}
+		return
+	}
+
+	id, ok := strings.CutPrefix(r.URL.Path, "/tasks/")
+	if !ok || id == "" || strings.Contains(id, "/") {
+		http.NotFound(w, r)
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		h.handleGet(w, r, id)
+	case http.MethodPatch:
+		h.handlePatch(w, r, id)
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
 }
 func (h *httpHandler) handleCreate(w http.ResponseWriter, r *http.Request) {
-	panic("TODO: implement")
+	var req struct {
+		Title *string `json:"title"`
+	}
+	if err := decodeStrictJSON(r.Body, &req); err != nil || req.Title == nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+
+	task, err := h.repo.Create(*req.Title)
+	if errors.Is(err, ErrInvalidTitle) {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusCreated, task)
 }
 func (h *httpHandler) handleGet(w http.ResponseWriter, r *http.Request, id string) {
-	panic("TODO: implement")
+	task, ok := h.repo.Get(id)
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+	writeJSON(w, http.StatusOK, task)
 }
 func (h *httpHandler) handleList(w http.ResponseWriter, r *http.Request) {
-	panic("TODO: implement")
+	done := false
+	values, ok := r.URL.Query()["done"]
+	if ok {
+		if len(values) != 1 || (values[0] != "true" && values[0] != "false") {
+			http.Error(w, "bad done parameter", http.StatusBadRequest)
+			return
+		}
+		done = values[0] == "true"
+	}
+
+	tasks := h.repo.List(done)
+	if tasks == nil {
+		tasks = []Task{}
+	}
+	slices.SortFunc(tasks, func(a, b Task) int {
+		if !a.UpdatedAt.Equal(b.UpdatedAt) {
+			return b.UpdatedAt.Compare(a.UpdatedAt)
+		}
+		return strings.Compare(a.ID, b.ID)
+	})
+	writeJSON(w, http.StatusOK, tasks)
 }
 func (h *httpHandler) handlePatch(w http.ResponseWriter, r *http.Request, id string) {
-	panic("TODO: implement")
+	var req struct {
+		Done *bool `json:"done"`
+	}
+	if err := decodeStrictJSON(r.Body, &req); err != nil || req.Done == nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+
+	task, err := h.repo.SetDone(id, *req.Done)
+	if errors.Is(err, ErrNotFound) {
+		http.NotFound(w, r)
+		return
+	}
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, task)
 }
 func decodeStrictJSON(r io.Reader, v any) error {
-	panic("TODO: implement")
+	dec := json.NewDecoder(r)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(v); err != nil {
+		return err
+	}
+	var extra any
+	if dec.Decode(&extra) != io.EOF {
+		return errors.New("extra data after JSON object")
+	}
+	return nil
 }
 func writeJSON(w http.ResponseWriter, status int, v any) {
-	panic("TODO: implement")
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(v)
 }
